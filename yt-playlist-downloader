@@ -17,17 +17,17 @@
 #   -h, --help         show this help
 #
 # CONFIG FILE
-#   If neither --file nor --url is given, the script looks for a playlist file at:
-#     $XDG_CONFIG_HOME/yt-playlist-downloader/playlists.conf   (usually ~/.config/yt-playlist-downloader/playlists.conf)
+#   Without --file or --url, URLs are read from:
+#     ~/.config/yt-playlist-downloader/playlists.conf   (respects $XDG_CONFIG_HOME)
 #   One URL per line. Lines starting with # and blank lines are ignored.
 #
-# FILE LAYOUT (inside ROOT_DIR, default: ~/Music, or Android shared storage under Termux)
+# FILE LAYOUT (inside ROOT_DIR, default: ~/Music)
 #   ROOT_DIR/
 #     <Playlist Title>/
 #       001 - Track Title [videoID].ogg
 #       002 - Another Track [videoID].ogg
-#     .archive          ← yt-dlp download archive (do not delete)
-#     .lock             ← removed after each run
+#     .archive          ← list of downloaded videos (delete it to re-download everything)
+#     .lock             ← exists only while a sync is running
 #
 # REQUIREMENTS
 #   yt-dlp   https://github.com/yt-dlp/yt-dlp
@@ -45,8 +45,9 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 warn() { echo "WARNING: $*" >&2; WARNINGS+=("$*"); }
 info() { echo ">>> $*"; }
 
-# Run yt-dlp, retrying when YouTube randomly refuses a playlist page (HTTP 403).
+# Run yt-dlp, retrying when YouTube rate-limits a playlist page request (HTTP 403).
 # Usage: yt_retry OUTFILE ARGS…   (OUTFILE "-" = terminal). Stderr goes to $ERR_FILE.
+# The last ARG must be the URL (it's used in the retry message).
 yt_retry() {
     local out="$1" attempt step="fetching playlist info"; shift
     [[ "$out" == - ]] && step="downloading"
@@ -59,7 +60,7 @@ yt_retry() {
         grep -q "Unable to download API page" "$ERR_FILE" || return 1
         [[ $attempt -lt 3 ]] && {
             info "YouTube refused the request while $step for ${*: -1} (attempt $attempt/3): $(grep -m1 -o 'HTTP Error [0-9]*: [A-Za-z ]*[A-Za-z]' "$ERR_FILE")"
-            # 403s here are rate limiting; a short pause doesn't clear it
+            # A short pause doesn't clear the rate limit, so back off 30s, then 60s
             info "Retrying in $((attempt * 30))s…"
             sleep $((attempt * 30))
         }
@@ -86,8 +87,7 @@ check_deps() {
   Arch/CachyOS:   sudo pacman -S yt-dlp ffmpeg
   Debian/Ubuntu:  sudo apt install ffmpeg && pipx install yt-dlp   (apt's yt-dlp is often outdated)
   Fedora:         sudo dnf install yt-dlp ffmpeg
-  macOS:          brew install yt-dlp ffmpeg
-  Termux:         pkg install python ffmpeg && pip install -U yt-dlp"
+  macOS:          brew install yt-dlp ffmpeg"
     fi
 }
 
@@ -117,38 +117,15 @@ done
 YTDLP_ARGS=(--sleep-requests 1)
 [[ -n "$COOKIES_BROWSER" ]] && YTDLP_ARGS+=(--cookies-from-browser "$COOKIES_BROWSER")
 
-# -- Android/Termux detection --
-# Under Termux, $HOME is Termux's private sandbox (/data/data/com.termux/files/home),
-# not real phone storage. If the person hasn't set up ~/storage (via
-# termux-setup-storage) yet, default there anyway and fail with a clear message
-# rather than silently writing files Termux can see but no other app can.
-IS_TERMUX=0
-[[ -n "${TERMUX_VERSION:-}" ]] && IS_TERMUX=1
-
-if [[ -z "$ROOT" ]]; then
-    if [[ $IS_TERMUX -eq 1 ]]; then
-        ROOT="$HOME/storage/shared/Music"
-    else
-        ROOT="$HOME/Music"
-    fi
-fi
-
-if [[ $IS_TERMUX -eq 1 && ! -d "$HOME/storage/shared" ]]; then
-    die "Termux shared storage isn't set up yet.
-  Run: termux-setup-storage
-  (then grant the storage permission Android asks for) and re-run this script."
-fi
+ROOT="${ROOT:-$HOME/Music}"
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 DEFAULT_CONF="$XDG_CONFIG_HOME/yt-playlist-downloader/playlists.conf"
 
-# -- Non-interactive detection --
-# When triggered headlessly (e.g. via MacroDroid -> Termux RUN_COMMAND, or any
-# cron/CI context), there is no controlling terminal, so the "Proceed? [y/N]"
-# prompt below would block forever on a read from /dev/tty that never resolves.
-# Auto-enable --no-confirm in that case instead of hanging.
+# Without a terminal (cron, systemd timer) the "Proceed? [y/N]" prompt would
+# hang forever, so skip it.
 if [[ $NO_CONFIRM -eq 0 && ! -e /dev/tty ]]; then
-    info "No controlling terminal detected (non-interactive run) — skipping confirmation prompt automatically."
+    info "No terminal detected — skipping the confirmation prompt."
     NO_CONFIRM=1
 fi
 
@@ -165,7 +142,6 @@ elif [[ -n "$PLAYLIST_FILE" ]]; then
     [[ -f "$PLAYLIST_FILE" ]] || die "Playlist file not found: $PLAYLIST_FILE"
 
 else
-    # Fall back to default config
     if [[ ! -f "$DEFAULT_CONF" ]]; then
         die "No playlist source given and no default config found at $DEFAULT_CONF
   Create it with one YouTube playlist URL per line, or use:
@@ -207,36 +183,27 @@ if ! ( set -o noclobber; echo "$$" > "$LOCKFILE" ) 2>/dev/null; then
 fi
 trap 'rm -f "$LOCKFILE"' EXIT
 
-# Temp dir — avoid shadowing the system TMPDIR variable
 WORK_DIR="$(mktemp -d)"
 ERR_FILE="$WORK_DIR/err.txt"
 trap 'rm -rf "$WORK_DIR"; rm -f "$LOCKFILE"' EXIT
 
-# -- Keep the CPU awake for the duration of the run under Termux --
-# Android aggressively suspends background processes; termux-wake-lock (from
-# the termux-api package) prevents the CPU from sleeping mid-download.
-if [[ $IS_TERMUX -eq 1 ]] && command -v termux-wake-lock &>/dev/null; then
-    termux-wake-lock
-    trap 'rm -rf "$WORK_DIR"; rm -f "$LOCKFILE"; termux-wake-unlock' EXIT
-fi
-
 # ---------------------------------------------------------------------------
 # Pre-flight: fetch metadata for all playlists, print summary, confirm
 # ---------------------------------------------------------------------------
-# We do this before any downloading so the user sees the full picture upfront.
-# Each playlist's ID list is cached in WORK_DIR and reused in the sync loop
-# below — no double network call.
+# Done before any downloading so you see the full picture upfront. The ID lists
+# fetched here decide which local files get deleted later.
 
-declare -A PLAYLIST_ID_FILES   # URL -> path to cached IDs file
-declare -A PLAYLIST_TRACK_COUNTS
-declare -A PLAYLIST_TITLES     # URL -> folder name, sanitized exactly as yt-dlp names it
+declare -A PLAYLIST_ID_FILES     # URL -> file with the playlist's video IDs
+declare -A PLAYLIST_TRACK_COUNTS # URL -> number of tracks
+declare -A PLAYLIST_TITLES       # URL -> folder name, sanitized exactly as yt-dlp names it
 VALID_URLS=()
 
 echo ""
 echo "Fetching playlist info…"
 
-for PLAYLIST_URL in "${PLAYLIST_URLS[@]}"; do
-    CURRENT_IDS="$WORK_DIR/ids_$(printf '%s' "$PLAYLIST_URL" | md5sum | cut -c1-8).txt"
+for i in "${!PLAYLIST_URLS[@]}"; do
+    PLAYLIST_URL="${PLAYLIST_URLS[$i]}"
+    CURRENT_IDS="$WORK_DIR/ids_$i.txt"
     PLAYLIST_ID_FILES["$PLAYLIST_URL"]="$CURRENT_IDS"
 
     # "--print filename" yields "<sanitized title>/<id>" per entry, so we get the
@@ -281,7 +248,7 @@ echo " Playlists   : ${#VALID_URLS[@]}"
 echo ""
 for PLAYLIST_URL in "${VALID_URLS[@]}"; do
     count="${PLAYLIST_TRACK_COUNTS[$PLAYLIST_URL]}"
-    printf '  [%3d tracks]  %s\n' "$count" "$PLAYLIST_URL"
+    printf '  [%3d tracks]  %s  (%s)\n' "$count" "${PLAYLIST_TITLES[$PLAYLIST_URL]}" "$PLAYLIST_URL"
 done
 echo ""
 echo " Tracks already in the archive will be skipped."
@@ -304,20 +271,18 @@ echo ""
 # Process each playlist
 # ---------------------------------------------------------------------------
 
-
 for PLAYLIST_URL in "${VALID_URLS[@]}"; do
+    CURRENT_IDS="${PLAYLIST_ID_FILES[$PLAYLIST_URL]}"
+    PLAYLIST_TITLE="${PLAYLIST_TITLES[$PLAYLIST_URL]}"
+
     echo ""
     echo "========================================"
-    info "Syncing: $PLAYLIST_URL"
+    info "Syncing: $PLAYLIST_TITLE (${PLAYLIST_TRACK_COUNTS[$PLAYLIST_URL]} tracks)"
     echo "========================================"
 
-    CURRENT_IDS="${PLAYLIST_ID_FILES[$PLAYLIST_URL]}"
-
-    info "Found ${PLAYLIST_TRACK_COUNTS[$PLAYLIST_URL]} tracks in playlist."
-
-    # -- Download / update --
-    # Errors on individual videos are tolerated (--ignore-errors); overall
-    # yt-dlp failure (e.g. network gone) is caught by the exit-code check.
+    # -- Download new tracks --
+    # --ignore-errors keeps going past broken videos; yt-dlp still exits non-zero,
+    # which we report as a warning. Failed tracks aren't archived, so the next run retries them.
     if ! yt_retry - \
             --extract-audio \
             --audio-format vorbis \
@@ -325,22 +290,19 @@ for PLAYLIST_URL in "${VALID_URLS[@]}"; do
             --format "ba[acodec=opus]/ba[ext=m4a]/ba" \
             --embed-metadata \
             --embed-thumbnail \
-            --parse-metadata "playlist:%(playlist_title)s:%(album)s" \
             --download-archive "$ARCHIVE" \
             --ignore-errors \
-            --continue \
             --concurrent-fragments 4 \
             --trim-filenames 180 \
             --no-warnings \
             --output "$ROOT/%(playlist_title)s/%(playlist_index)03d - %(title)s [%(id)s].%(ext)s" \
             "$PLAYLIST_URL"; then
         cat "$ERR_FILE" >&2
-        warn "yt-dlp reported errors for $PLAYLIST_URL (some tracks may have been skipped)."
-        # Don't skip deletion step — partial sync is still a valid sync
+        warn "yt-dlp reported errors for $PLAYLIST_TITLE (some tracks may have been skipped)."
+        # Still run the deletion step: it relies on the ID list from pre-flight, not this download
     fi
 
-    PLAYLIST_TITLE="${PLAYLIST_TITLES[$PLAYLIST_URL]}"
-
+    # An empty title would make PLAYLIST_DIR the whole ROOT and delete other playlists' tracks
     if [[ -z "$PLAYLIST_TITLE" ]]; then
         warn "Could not determine playlist title — skipping deletion step for $PLAYLIST_URL."
         continue
@@ -355,9 +317,8 @@ for PLAYLIST_URL in "${VALID_URLS[@]}"; do
         removed=0
         while IFS= read -r -d '' file; do
             filename="$(basename "$file")"
-            # Extract the [videoID] portion — robust to brackets in the title
-            # because yt-dlp always appends [id] right before the extension.
-            id="${filename%\.*}"          # strip extension
+            # "… [videoID].ogg": the ID is in the last brackets, so brackets in titles are fine
+            id="${filename%.*}"          # strip extension
             id="${id##*\[}"              # take everything after the last [
             id="${id%\]}"                # strip trailing ]
 
@@ -379,7 +340,7 @@ for PLAYLIST_URL in "${VALID_URLS[@]}"; do
         [[ $removed -gt 0 ]] && info "Removed $removed track(s)." || info "No tracks to remove."
     fi
 
-    info "Done: $PLAYLIST_URL"
+    info "Done: $PLAYLIST_TITLE"
 done
 
 echo ""
